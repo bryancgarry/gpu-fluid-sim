@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <utility>
 #include <cufft.h>
 #include <curand.h>
 #include <thrust/device_vector.h>
@@ -46,6 +47,7 @@
 
 // Threads per block for custom kernels
 #define BLOCK_SIZE        256
+#define BLOCK_DIM         16    // 16 x 16 blocks for 2D grid kernels
 
 // u and v are transformed together in one batched cuFFT call
 #define VELOCITY_COMPONENTS 2
@@ -65,11 +67,24 @@
 #define FILENAME_LENGTH   64
 #define GRAY_MAX          255.0f
 
+// Video output, frames are piped straight into ffmpeg
+#define VIDEO_FILE        "fluid.mp4"
+#define VIDEO_FPS         30
+#define COMMAND_LENGTH    256
+
+// Simulation settings
+#define NUM_FRAMES        300
+#define TIME_STEP         1.0f
+#define MAX_SPEED         2.0f  // fastest cell moves this many cells per step
+#define DYE_BANDS         8     // even, so the stripes wrap cleanly
+
 struct FieldBuffers {
     cufftComplex *d_psiHat; // random stream function spectrum
     cufftComplex *d_velHat; // u and v spectra, back to back
     float *d_vel;           // real u and v fields, back to back
     float *d_speed;         // speed for the output image
+    float *d_dye;           // dye density at the current step
+    float *d_dyeNext;       // advect output, swapped with d_dye
 };
 
 struct RunResults {
@@ -152,6 +167,57 @@ __global__ void computeSpeed(const float *vel, float *speed,
     speed[idx] = sqrtf(u * u + v * v);
 }
 
+// Starting dye pattern: horizontal stripes, so the stretching and
+// folding from the turbulence is easy to see
+__global__ void initDye(float *dye, int gridSize)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= gridSize || y >= gridSize)
+        return;
+
+    dye[y * gridSize + x] = (y * DYE_BANDS / gridSize) % 2;
+}
+
+// Bilinear sample of the field at a fractional cell position. The
+// domain is periodic, so positions off one edge wrap to the other
+__device__ float sampleWrapped(const float *field, int gridSize,
+                               float x, float y)
+{
+    float fx = floorf(x);
+    float fy = floorf(y);
+    float tx = x - fx;
+    float ty = y - fy;
+
+    int x0 = ((int)fx % gridSize + gridSize) % gridSize;
+    int y0 = ((int)fy % gridSize + gridSize) % gridSize;
+    int x1 = (x0 + 1) % gridSize;
+    int y1 = (y0 + 1) % gridSize;
+
+    const float *row0 = field + y0 * gridSize;
+    const float *row1 = field + y1 * gridSize;
+    float top    = row0[x0] * (1.0f - tx) + row0[x1] * tx;
+    float bottom = row1[x0] * (1.0f - tx) + row1[x1] * tx;
+    return top * (1.0f - ty) + bottom * ty;
+}
+
+// Advection calculation, each cell traces backward along the velocity
+// field and takes the dye from where it came from
+__global__ void advect(const float *src, float *dst, const float *vel,
+                       int gridSize)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= gridSize || y >= gridSize)
+        return;
+
+    int cellCount = gridSize * gridSize;
+    int idx = y * gridSize + x;
+    dst[idx] = sampleWrapped(src, gridSize,
+                             x - TIME_STEP * vel[idx],
+                             y - TIME_STEP * vel[idx + cellCount]);
+}
+
 /* ------------------------------------------------------------------ */
 /* Thrust functors                                                    */
 /* ------------------------------------------------------------------ */
@@ -224,13 +290,22 @@ struct Square {
     }
 };
 
-// Map speed in [0, maxSpeed] to an 8-bit gray level
+// Map a value in [0, maxValue] to an 8-bit gray level
 struct ToGray {
-    float maxSpeed;
+    float maxValue;
 
     __host__ __device__ unsigned char operator()(float s) const
     {
-        return (unsigned char)(GRAY_MAX * s / maxSpeed);
+        return (unsigned char)(GRAY_MAX * s / maxValue);
+    }
+};
+
+struct Scale {
+    float factor;
+
+    __host__ __device__ float operator()(float x) const
+    {
+        return x * factor;
     }
 };
 
@@ -356,6 +431,8 @@ void allocateBuffers(FieldBuffers &buf, int gridSize)
                VELOCITY_COMPONENTS * modeCount * sizeof(cufftComplex));
     cudaMalloc(&buf.d_vel, VELOCITY_COMPONENTS * cellCount * sizeof(float));
     cudaMalloc(&buf.d_speed, cellCount * sizeof(float));
+    cudaMalloc(&buf.d_dye, cellCount * sizeof(float));
+    cudaMalloc(&buf.d_dyeNext, cellCount * sizeof(float));
 }
 
 void freeBuffers(FieldBuffers &buf)
@@ -364,6 +441,8 @@ void freeBuffers(FieldBuffers &buf)
     cudaFree(buf.d_velHat);
     cudaFree(buf.d_vel);
     cudaFree(buf.d_speed);
+    cudaFree(buf.d_dye);
+    cudaFree(buf.d_dyeNext);
 }
 
 // Least squares slope of log E(k) against log k over [kMin, kMax]
@@ -416,29 +495,53 @@ void analyzeField(FieldBuffers &buf, int gridSize, RunResults &results)
     free(h_spectrum);
 }
 
-// Speed kernel, then Thrust finds the peak speed and converts the
-// field to gray levels on the GPU before writing a binary PGM image
-void writeSpeedImage(FieldBuffers &buf, int gridSize,
-                     const char *filename)
+// Thrust finds the field's peak value and converts it to gray levels
+// on the GPU before writing the raw pixels out. Zero is black, the
+// peak is white
+void writeFieldPixels(float *d_field, int gridSize, FILE *out)
+{
+    int cellCount = gridSize * gridSize;
+    thrust::device_ptr<float> field(d_field);
+    float maxValue = *thrust::max_element(field, field + cellCount);
+
+    thrust::device_vector<unsigned char> pixels(cellCount);
+    thrust::transform(field, field + cellCount, pixels.begin(),
+                      ToGray{maxValue});
+    thrust::host_vector<unsigned char> h_pixels = pixels;
+
+    fwrite(h_pixels.data(), 1, cellCount, out);
+}
+
+// Speed kernel, then write the speed field's pixels
+void writeSpeedPixels(FieldBuffers &buf, int gridSize, FILE *out)
 {
     int cellCount = gridSize * gridSize;
     int blocks = (cellCount + BLOCK_SIZE - 1) / BLOCK_SIZE;
     computeSpeed<<<blocks, BLOCK_SIZE>>>(buf.d_vel, buf.d_speed,
                                          gridSize);
+    writeFieldPixels(buf.d_speed, gridSize, out);
+}
 
-    // Zero speed is black, the fastest cell is white
-    thrust::device_ptr<float> speed(buf.d_speed);
-    float maxSpeed = *thrust::max_element(speed, speed + cellCount);
-
-    thrust::device_vector<unsigned char> pixels(cellCount);
-    thrust::transform(speed, speed + cellCount, pixels.begin(),
-                      ToGray{maxSpeed});
-    thrust::host_vector<unsigned char> h_pixels = pixels;
-
+// Binary PGM image of the speed field
+void writeSpeedImage(FieldBuffers &buf, int gridSize,
+                     const char *filename)
+{
     FILE *file = fopen(filename, "wb");
     fprintf(file, "P5\n%d %d\n255\n", gridSize, gridSize);
-    fwrite(h_pixels.data(), 1, cellCount, file);
+    writeSpeedPixels(buf, gridSize, file);
     fclose(file);
+}
+
+// Start ffmpeg reading raw 8-bit gray frames from stdin and
+// encoding them to an mp4
+FILE *openVideo(int gridSize)
+{
+    char command[COMMAND_LENGTH];
+    snprintf(command, COMMAND_LENGTH,
+             "ffmpeg -y -loglevel error -f rawvideo -pix_fmt gray "
+             "-s %dx%d -r %d -i - -pix_fmt yuv420p %s",
+             gridSize, gridSize, VIDEO_FPS, VIDEO_FILE);
+    return popen(command, "w");
 }
 
 const char *passFail(bool passed)
@@ -503,6 +606,51 @@ void runPipeline(int gridSize, float slope, unsigned long long seed)
     freeBuffers(buf);
 }
 
+// cuFFT's output is unnormalized, so the raw velocity scale depends on
+// the grid size. Rescale so the fastest cell moves MAX_SPEED cells per
+// step at every grid size
+void normalizeVelocity(FieldBuffers &buf, int gridSize)
+{
+    int cellCount = gridSize * gridSize;
+    int blocks = (cellCount + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    computeSpeed<<<blocks, BLOCK_SIZE>>>(buf.d_vel, buf.d_speed,
+                                         gridSize);
+
+    thrust::device_ptr<float> speed(buf.d_speed);
+    float maxSpeed = *thrust::max_element(speed, speed + cellCount);
+
+    thrust::device_ptr<float> vel(buf.d_vel);
+    thrust::transform(vel, vel + VELOCITY_COMPONENTS * cellCount, vel,
+                      Scale{MAX_SPEED / maxSpeed});
+}
+
+// Generate the starting turbulent field, then advect stripes of dye
+// through it, piping every frame to ffmpeg
+void runSimulation(int gridSize, float slope, unsigned long long seed)
+{
+    FieldBuffers buf;
+    allocateBuffers(buf, gridSize);
+    generateField(buf, gridSize, slope, seed);
+    normalizeVelocity(buf, gridSize);
+
+    dim3 block(BLOCK_DIM, BLOCK_DIM);
+    dim3 grid((gridSize + BLOCK_DIM - 1) / BLOCK_DIM,
+              (gridSize + BLOCK_DIM - 1) / BLOCK_DIM);
+    initDye<<<grid, block>>>(buf.d_dye, gridSize);
+
+    FILE *video = openVideo(gridSize);
+    for (int frame = 0; frame < NUM_FRAMES; frame++) {
+        writeFieldPixels(buf.d_dye, gridSize, video);
+        advect<<<grid, block>>>(buf.d_dye, buf.d_dyeNext, buf.d_vel,
+                                gridSize);
+        std::swap(buf.d_dye, buf.d_dyeNext);
+    }
+    pclose(video);
+    printf("Wrote %d frames to %s\n", NUM_FRAMES, VIDEO_FILE);
+
+    freeBuffers(buf);
+}
+
 int main(int argc, char **argv)
 {
     int gridSize = (argc > 1) ? atoi(argv[1]) : DEFAULT_GRID_SIZE;
@@ -518,6 +666,6 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    runPipeline(gridSize, slope, seed);
+    runSimulation(gridSize, slope, seed);
     return 0;
 }
