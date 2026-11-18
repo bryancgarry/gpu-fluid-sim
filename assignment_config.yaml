@@ -1,0 +1,11 @@
+folder: assignment
+
+build: {}
+
+run:
+  # baseline: 512 grid, Kolmogorov -5/3 slope
+  - [512, -1.6667, 42]
+
+  # additional grid sizes
+  - [256, -1.6667, 42]
+  - [1024, -1.6667, 42]
