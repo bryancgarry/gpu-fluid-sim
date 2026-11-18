@@ -77,11 +77,13 @@
 #define TIME_STEP         1.0f
 #define MAX_SPEED         2.0f  // fastest cell moves this many cells per step
 #define DYE_BANDS         8     // even, so the stripes wrap cleanly
+#define DIVERGENCE_INTERVAL 30  // frames between divergence reports
 
 struct FieldBuffers {
     cufftComplex *d_psiHat; // random stream function spectrum
     cufftComplex *d_velHat; // u and v spectra, back to back
     float *d_vel;           // real u and v fields, back to back
+    float *d_velNext;       // advected u and v, swapped with d_vel
     float *d_speed;         // speed for the output image
     float *d_dye;           // dye density at the current step
     float *d_dyeNext;       // advect output, swapped with d_dye
@@ -430,6 +432,8 @@ void allocateBuffers(FieldBuffers &buf, int gridSize)
     cudaMalloc(&buf.d_velHat,
                VELOCITY_COMPONENTS * modeCount * sizeof(cufftComplex));
     cudaMalloc(&buf.d_vel, VELOCITY_COMPONENTS * cellCount * sizeof(float));
+    cudaMalloc(&buf.d_velNext,
+               VELOCITY_COMPONENTS * cellCount * sizeof(float));
     cudaMalloc(&buf.d_speed, cellCount * sizeof(float));
     cudaMalloc(&buf.d_dye, cellCount * sizeof(float));
     cudaMalloc(&buf.d_dyeNext, cellCount * sizeof(float));
@@ -440,6 +444,7 @@ void freeBuffers(FieldBuffers &buf)
     cudaFree(buf.d_psiHat);
     cudaFree(buf.d_velHat);
     cudaFree(buf.d_vel);
+    cudaFree(buf.d_velNext);
     cudaFree(buf.d_speed);
     cudaFree(buf.d_dye);
     cudaFree(buf.d_dyeNext);
@@ -624,8 +629,16 @@ void normalizeVelocity(FieldBuffers &buf, int gridSize)
                       Scale{MAX_SPEED / maxSpeed});
 }
 
-// Generate the starting turbulent field, then advect stripes of dye
-// through it, piping every frame to ffmpeg
+// Forward cuFFT, then the Module 9 spectral divergence check
+void reportDivergence(FieldBuffers &buf, int gridSize, int frame)
+{
+    velocityToSpectrum(buf.d_vel, buf.d_velHat, gridSize);
+    printf("  Frame %4d | relative divergence %9.2e\n", frame,
+           relativeDivergence(buf.d_velHat, gridSize));
+}
+
+// Generate the starting turbulent field, then advect the dye and the
+// velocity itself through it, piping every frame to ffmpeg
 void runSimulation(int gridSize, float slope, unsigned long long seed)
 {
     FieldBuffers buf;
@@ -638,12 +651,24 @@ void runSimulation(int gridSize, float slope, unsigned long long seed)
               (gridSize + BLOCK_DIM - 1) / BLOCK_DIM);
     initDye<<<grid, block>>>(buf.d_dye, gridSize);
 
+    int cellCount = gridSize * gridSize;
     FILE *video = openVideo(gridSize);
     for (int frame = 0; frame < NUM_FRAMES; frame++) {
         writeFieldPixels(buf.d_dye, gridSize, video);
+        if (frame % DIVERGENCE_INTERVAL == 0)
+            reportDivergence(buf, gridSize, frame);
+
+        // Dye, u and v are all traced back through the same velocity
+        // field, so the new velocity is only swapped in afterward
         advect<<<grid, block>>>(buf.d_dye, buf.d_dyeNext, buf.d_vel,
                                 gridSize);
+        advect<<<grid, block>>>(buf.d_vel, buf.d_velNext, buf.d_vel,
+                                gridSize);
+        advect<<<grid, block>>>(buf.d_vel + cellCount,
+                                buf.d_velNext + cellCount, buf.d_vel,
+                                gridSize);
         std::swap(buf.d_dye, buf.d_dyeNext);
+        std::swap(buf.d_vel, buf.d_velNext);
     }
     pclose(video);
     printf("Wrote %d frames to %s\n", NUM_FRAMES, VIDEO_FILE);
