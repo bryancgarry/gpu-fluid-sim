@@ -78,12 +78,16 @@
 #define MAX_SPEED         2.0f  // fastest cell moves this many cells per step
 #define DYE_BANDS         8     // even, so the stripes wrap cleanly
 #define DIVERGENCE_INTERVAL 30  // frames between divergence reports
+#define JACOBI_ITERATIONS 40    // pressure solve iterations per step
 
 struct FieldBuffers {
     cufftComplex *d_psiHat; // random stream function spectrum
     cufftComplex *d_velHat; // u and v spectra, back to back
     float *d_vel;           // real u and v fields, back to back
     float *d_velNext;       // advected u and v, swapped with d_vel
+    float *d_divergence;    // velocity divergence, pressure solve input
+    float *d_pressure;      // pressure at the current Jacobi iteration
+    float *d_pressureNext;  // Jacobi output, swapped with d_pressure
     float *d_speed;         // speed for the output image
     float *d_dye;           // dye density at the current step
     float *d_dyeNext;       // advect output, swapped with d_dye
@@ -218,6 +222,79 @@ __global__ void advect(const float *src, float *dst, const float *vel,
     dst[idx] = sampleWrapped(src, gridSize,
                              x - TIME_STEP * vel[idx],
                              y - TIME_STEP * vel[idx + cellCount]);
+}
+
+// Central difference divergence du/dx + dv/dy, wrapping at the edges
+__global__ void computeDivergence(const float *vel, float *divergence,
+                                  int gridSize)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= gridSize || y >= gridSize)
+        return;
+
+    int cellCount = gridSize * gridSize;
+    int left  = (x + gridSize - 1) % gridSize;
+    int right = (x + 1) % gridSize;
+    int up    = (y + gridSize - 1) % gridSize;
+    int down  = (y + 1) % gridSize;
+    const float *v = vel + cellCount;
+
+    divergence[y * gridSize + x] =
+        0.5f * (vel[y * gridSize + right] - vel[y * gridSize + left]
+              + v[down * gridSize + x] - v[up * gridSize + x]);
+}
+
+// Jacobi iteration of the pressure Poisson equation, laplacian(p) = div.
+// The laplacian is built from the same central differences used for the
+// divergence and the gradient, which reach two cells out. That keeps the
+// projection consistent, so the measured divergence keeps dropping as
+// iterations are added instead of stalling. Wraps at the edges.
+__global__ void pressureJacobi(const float *divergence,
+                               const float *guess, float *result,
+                               int gridSize)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= gridSize || y >= gridSize)
+        return;
+
+    int left  = (x + gridSize - 2) % gridSize;
+    int right = (x + 2) % gridSize;
+    int up    = (y + gridSize - 2) % gridSize;
+    int down  = (y + 2) % gridSize;
+
+    float neighbors = guess[y * gridSize + left]
+                    + guess[y * gridSize + right]
+                    + guess[up * gridSize + x]
+                    + guess[down * gridSize + x];
+
+    result[y * gridSize + x] =
+        0.25f * neighbors - divergence[y * gridSize + x];
+}
+
+// Subtract the pressure gradient from the velocity, which removes its
+// divergent part. Each thread only writes its own cell, so this can
+// run in place
+__global__ void subtractGradient(float *vel, const float *pressure,
+                                 int gridSize)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= gridSize || y >= gridSize)
+        return;
+
+    int cellCount = gridSize * gridSize;
+    int idx   = y * gridSize + x;
+    int left  = (x + gridSize - 1) % gridSize;
+    int right = (x + 1) % gridSize;
+    int up    = (y + gridSize - 1) % gridSize;
+    int down  = (y + 1) % gridSize;
+
+    vel[idx] -= 0.5f * (pressure[y * gridSize + right]
+                      - pressure[y * gridSize + left]);
+    vel[idx + cellCount] -= 0.5f * (pressure[down * gridSize + x]
+                                  - pressure[up * gridSize + x]);
 }
 
 /* ------------------------------------------------------------------ */
@@ -437,6 +514,9 @@ void allocateBuffers(FieldBuffers &buf, int gridSize)
     cudaMalloc(&buf.d_speed, cellCount * sizeof(float));
     cudaMalloc(&buf.d_dye, cellCount * sizeof(float));
     cudaMalloc(&buf.d_dyeNext, cellCount * sizeof(float));
+    cudaMalloc(&buf.d_divergence, cellCount * sizeof(float));
+    cudaMalloc(&buf.d_pressure, cellCount * sizeof(float));
+    cudaMalloc(&buf.d_pressureNext, cellCount * sizeof(float));
 }
 
 void freeBuffers(FieldBuffers &buf)
@@ -448,6 +528,9 @@ void freeBuffers(FieldBuffers &buf)
     cudaFree(buf.d_speed);
     cudaFree(buf.d_dye);
     cudaFree(buf.d_dyeNext);
+    cudaFree(buf.d_divergence);
+    cudaFree(buf.d_pressure);
+    cudaFree(buf.d_pressureNext);
 }
 
 // Least squares slope of log E(k) against log k over [kMin, kMax]
@@ -629,16 +712,49 @@ void normalizeVelocity(FieldBuffers &buf, int gridSize)
                       Scale{MAX_SPEED / maxSpeed});
 }
 
-// Forward cuFFT, then the Module 9 spectral divergence check
-void reportDivergence(FieldBuffers &buf, int gridSize, int frame)
+// Jacobi iterations from a zero guess, so the final pressure ends up
+// in d_pressure
+void solvePressure(FieldBuffers &buf, int gridSize, dim3 grid,
+                   dim3 block)
 {
-    velocityToSpectrum(buf.d_vel, buf.d_velHat, gridSize);
-    printf("  Frame %4d | relative divergence %9.2e\n", frame,
-           relativeDivergence(buf.d_velHat, gridSize));
+    cudaMemset(buf.d_pressure, 0,
+               (size_t)gridSize * gridSize * sizeof(float));
+    for (int i = 0; i < JACOBI_ITERATIONS; i++) {
+        pressureJacobi<<<grid, block>>>(buf.d_divergence, buf.d_pressure,
+                                        buf.d_pressureNext, gridSize);
+        std::swap(buf.d_pressure, buf.d_pressureNext);
+    }
 }
 
-// Generate the starting turbulent field, then advect the dye and the
-// velocity itself through it, piping every frame to ffmpeg
+// Pressure projection: divergence, pressure solve, then subtract the
+// pressure gradient so the velocity is divergence-free again
+void project(FieldBuffers &buf, int gridSize, dim3 grid, dim3 block)
+{
+    computeDivergence<<<grid, block>>>(buf.d_vel, buf.d_divergence,
+                                       gridSize);
+    solvePressure(buf, gridSize, grid, block);
+    subtractGradient<<<grid, block>>>(buf.d_vel, buf.d_pressure,
+                                      gridSize);
+}
+
+// RMS of the same central difference divergence the projection uses
+double rmsDivergence(FieldBuffers &buf, int gridSize, dim3 grid,
+                     dim3 block)
+{
+    int cellCount = gridSize * gridSize;
+    computeDivergence<<<grid, block>>>(buf.d_vel, buf.d_divergence,
+                                       gridSize);
+    thrust::device_ptr<float> divergence(buf.d_divergence);
+    return sqrt(thrust::transform_reduce(divergence,
+                                         divergence + cellCount,
+                                         Square(), 0.0,
+                                         thrust::plus<double>())
+                / cellCount);
+}
+
+// Generate the starting turbulent field, then each step advect the dye
+// and the velocity, project the velocity back to divergence-free, and
+// pipe the dye frame to ffmpeg
 void runSimulation(int gridSize, float slope, unsigned long long seed)
 {
     FieldBuffers buf;
@@ -655,8 +771,6 @@ void runSimulation(int gridSize, float slope, unsigned long long seed)
     FILE *video = openVideo(gridSize);
     for (int frame = 0; frame < NUM_FRAMES; frame++) {
         writeFieldPixels(buf.d_dye, gridSize, video);
-        if (frame % DIVERGENCE_INTERVAL == 0)
-            reportDivergence(buf, gridSize, frame);
 
         // Dye, u and v are all traced back through the same velocity
         // field, so the new velocity is only swapped in afterward
@@ -669,6 +783,14 @@ void runSimulation(int gridSize, float slope, unsigned long long seed)
                                 gridSize);
         std::swap(buf.d_dye, buf.d_dyeNext);
         std::swap(buf.d_vel, buf.d_velNext);
+
+        if (frame % DIVERGENCE_INTERVAL == 0)
+            printf("  Frame %4d | RMS divergence before %9.2e",
+                   frame, rmsDivergence(buf, gridSize, grid, block));
+        project(buf, gridSize, grid, block);
+        if (frame % DIVERGENCE_INTERVAL == 0)
+            printf(" | after %9.2e\n",
+                   rmsDivergence(buf, gridSize, grid, block));
     }
     pclose(video);
     printf("Wrote %d frames to %s\n", NUM_FRAMES, VIDEO_FILE);
